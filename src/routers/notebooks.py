@@ -6,7 +6,7 @@ from surrealdb import AsyncSurreal
 
 from ..database import get_db_connection
 from ..models import (
-    Notebook, NotebookCreate, NotebookUpdate, NotebookSummary, StatusResponse, NoteResponse, NotebookWithNotesResponse
+    Notebook, NotebookCreate, NotebookUpdate, NotebookSummary, StatusResponse, NoteResponse, NotebookWithNotesResponse, SourceSummary
 )
 
 # Create a router for notebook-related endpoints
@@ -115,7 +115,7 @@ async def get_notebook_by_name(
     name: str,
     db: AsyncSurreal = Depends(get_db_connection)
 ):
-    """Gets details of a specific notebook by its name, including notes."""
+    """Gets details of a specific notebook by its name, including notes and sources."""
     try:
         query = f"SELECT * FROM {NOTEBOOK_TABLE} WHERE name = $name"
         bindings = {"name": name}
@@ -158,6 +158,37 @@ async def get_notebook_by_name(
                 embedding=note_dict.get("embedding", [])
             ))
 
+        # Fetch sources for this notebook
+        sources_query = f"""
+            SELECT id, title, type, status, created, updated, metadata
+            FROM source
+            WHERE notebook_id = $nb_id
+            ORDER BY created DESC
+        """
+        sources_result = await db.query(sources_query, {"nb_id": notebook_id})
+        sources = []
+        for source in sources_result or []:
+            source_dict = dict(source)
+            # Convert source id to string if it's a RecordID
+            if hasattr(source_dict.get('id', None), 'table_name') and hasattr(source_dict.get('id', None), 'record_id'):
+                source_dict['id'] = f"{source_dict['id'].table_name}:{source_dict['id'].record_id}"
+            elif source_dict.get('id', None) is not None:
+                source_dict['id'] = str(source_dict['id'])
+            
+            # Handle title from metadata if not directly present
+            if not source_dict.get('title'):
+                source_dict['title'] = source_dict.get('metadata', {}).get('title', 'Untitled Source')
+            
+            sources.append(SourceSummary(
+                id=str(source_dict.get("id", "")),
+                title=str(source_dict.get("title", "")),
+                type=str(source_dict.get("type", "")),
+                status=str(source_dict.get("status", "")),
+                created=source_dict.get("created"),
+                updated=source_dict.get("updated"),
+                metadata=source_dict.get("metadata", {})
+            ))
+
         # Create the response with string IDs
         return NotebookWithNotesResponse(
             id=str(notebook_id),  # Ensure ID is string
@@ -168,7 +199,7 @@ async def get_notebook_by_name(
             archived=notebook["archived"],
             metadata=notebook.get("metadata", {}),
             notes=notes,
-            sources=[],  # Add sources if needed
+            sources=sources,
             chat_sessions=[]  # Add chat sessions if needed
         )
 
@@ -183,7 +214,7 @@ async def get_notebook(
     notebook_id: str,
     db: AsyncSurreal = Depends(get_db_connection)
 ):
-    """Gets details of a specific notebook by its ID, including notes."""
+    """Gets details of a specific notebook by its ID, including notes and sources."""
     # Accept both 'id' and 'notebook:id' formats
     if ":" not in notebook_id:
         notebook_id = f"notebook:{notebook_id}"
@@ -221,6 +252,37 @@ async def get_notebook(
             for note in notes_result or []
         ]
 
+        # Fetch sources for this notebook
+        sources_query = f"""
+            SELECT id, title, type, status, created, updated, metadata
+            FROM source
+            WHERE notebook_id = $nb_id
+            ORDER BY created DESC
+        """
+        sources_result = await db.query(sources_query, {"nb_id": notebook_id})
+        sources = []
+        for source in sources_result or []:
+            source_dict = dict(source)
+            # Convert source id to string if it's a RecordID
+            if hasattr(source_dict.get('id', None), 'table_name') and hasattr(source_dict.get('id', None), 'record_id'):
+                source_dict['id'] = f"{source_dict['id'].table_name}:{source_dict['id'].record_id}"
+            elif source_dict.get('id', None) is not None:
+                source_dict['id'] = str(source_dict['id'])
+            
+            # Handle title from metadata if not directly present
+            if not source_dict.get('title'):
+                source_dict['title'] = source_dict.get('metadata', {}).get('title', 'Untitled Source')
+            
+            sources.append(SourceSummary(
+                id=str(source_dict.get("id", "")),
+                title=str(source_dict.get("title", "")),
+                type=str(source_dict.get("type", "")),
+                status=str(source_dict.get("status", "")),
+                created=source_dict.get("created"),
+                updated=source_dict.get("updated"),
+                metadata=source_dict.get("metadata", {})
+            ))
+
         return NotebookWithNotesResponse(
             name=notebook["name"],
             description=notebook["description"],
@@ -228,7 +290,10 @@ async def get_notebook(
             created=notebook["created"],
             updated=notebook["updated"],
             archived=notebook["archived"],
-            notes=notes
+            metadata=notebook.get("metadata", {}),
+            notes=notes,
+            sources=sources,
+            chat_sessions=[]
         )
     except HTTPException as http_exc:
         raise http_exc

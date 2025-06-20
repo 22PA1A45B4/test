@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Any
 import os
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from datetime import datetime
 
 from surrealdb import AsyncSurreal
 
@@ -17,6 +18,7 @@ from ..models import (
     ChatContext, Source, Note, ApplyTransformationRequest, ChatRequest, AskRequest
 )
 from open_notebook.models import MODEL_CLASS_MAP, LanguageModel
+from pydantic import BaseModel
 
 # Create a router for AI interaction endpoints
 router = APIRouter(
@@ -187,18 +189,69 @@ async def apply_transformation(
 ):
     """Applies a transformation to a source (e.g., summarization, key points extraction)."""
     if ":" not in source_id:
-         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid source ID format.")
-    # Placeholder implementation:
-    print(f"Received transformation request for source {source_id}: {request_data}")
-    api_key_provided_str = "Yes" if x_provider_api_key else "No"
-    print(f"API Key provided in header: {api_key_provided_str}")
-    # In a real app, apply the transformation and return results
-    return SourceInsight(
-        source_id=source_id,
-        transformation_type=request_data.transformation_type,
-        result="Placeholder transformation result",
-        metadata={"model": "placeholder"}
-    )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid source ID format.")
+    try:
+        # 1. Fetch the source
+        source_result = await db.select(source_id)
+        if not source_result:
+            raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
+        source = source_result if isinstance(source_result, dict) else dict(source_result)
+        full_text = source.get("full_text") or source.get("content")
+        if not full_text:
+            raise HTTPException(status_code=400, detail="Source has no content to transform.")
+
+        # 2. Fetch the transformation
+        transformation_id = request_data.transformation_id
+        transformation_result = await db.select(transformation_id)
+        if not transformation_result:
+            raise HTTPException(status_code=404, detail=f"Transformation {transformation_id} not found")
+        transformation = transformation_result if isinstance(transformation_result, dict) else dict(transformation_result)
+        transformation_prompt = transformation.get("prompt")
+        transformation_title = transformation.get("title", "Insight")
+        if not transformation_prompt:
+            raise HTTPException(status_code=400, detail="Transformation has no prompt.")
+
+        # 3. Run the transformation prompt using the selected model
+        provider = request_data.metadata.get("provider") or DEFAULT_MODEL_PROVIDER
+        model_name = request_data.model_id or DEFAULT_MODEL_NAME
+        # Compose the prompt
+        prompt = transformation_prompt + "\n\n# INPUT\n" + full_text
+        # Use the LLM
+        model = initialize_model(provider, model_name, x_provider_api_key)
+        langchain_model = model.to_langchain()
+        lc_messages = [SystemMessage(content=transformation_prompt), HumanMessage(content=full_text)]
+        response = await langchain_model.ainvoke(lc_messages)
+        insight_content = response.content if hasattr(response, "content") else str(response)
+
+        # 4. Create a new source_insight record in SurrealDB
+        now = datetime.utcnow()
+        insight_data = {
+            "source": source_id,
+            "insight_type": transformation_title,
+            "content": insight_content,
+            "created": now,
+            "transformation_id": transformation_id,
+            "metadata": {"model": model_name, "provider": provider}
+        }
+        created = await db.create("source_insight", insight_data)
+        if not created or not isinstance(created, list) or not created[0]:
+            raise HTTPException(status_code=500, detail="Failed to create source insight.")
+        created_insight = created[0]
+        # 5. Return the created insight as SourceInsight
+        return SourceInsight(
+            id=str(created_insight.get("id", "")),
+            title=transformation_title,
+            content=insight_content,
+            transformation_id=transformation_id,
+            source_id=source_id,
+            created=now,
+            metadata=created_insight.get("metadata", {})
+        )
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Error applying transformation to source {source_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error applying transformation: {e}")
 
 @router.post("/notebooks/by-name/{name}/chat", response_model=ChatResponse)
 async def chat_with_notebook_by_name(
@@ -341,4 +394,68 @@ async def ask_knowledge_base(
     except Exception as e:
         print(f"Error in ask endpoint: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error in ask: {e}")
+
+class TransformationModel(BaseModel):
+    id: Optional[str] = None
+    name: str
+    title: str
+    description: str
+    prompt: str
+    apply_default: bool = False
+    created: Optional[datetime] = None
+    updated: Optional[datetime] = None
+
+@router.get("/transformations", response_model=List[TransformationModel])
+async def list_transformations(db: AsyncSurreal = Depends(get_db_connection)):
+    """List all transformations."""
+    query = f"SELECT * FROM {TRANSFORMATION_TABLE} ORDER BY updated DESC"
+    result = await db.query(query)
+    if not result:
+        return []
+    # SurrealDB may return a list of dicts or objects
+    return [TransformationModel(**(r.model_dump() if hasattr(r, 'model_dump') else dict(r))) for r in result]
+
+@router.get("/transformations/{transformation_id}", response_model=TransformationModel)
+async def get_transformation(transformation_id: str, db: AsyncSurreal = Depends(get_db_connection)):
+    """Get a specific transformation by ID."""
+    if ":" not in transformation_id:
+        raise HTTPException(status_code=400, detail="Invalid transformation ID format. Expected table:id")
+    result = await db.select(transformation_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Transformation not found")
+    return TransformationModel(**(result.model_dump() if hasattr(result, 'model_dump') else dict(result)))
+
+@router.post("/transformations", response_model=TransformationModel, status_code=status.HTTP_201_CREATED)
+async def create_transformation(transformation: TransformationModel, db: AsyncSurreal = Depends(get_db_connection)):
+    """Create a new transformation."""
+    now = datetime.utcnow()
+    data = transformation.model_dump(exclude_unset=True)
+    data["created"] = now
+    data["updated"] = now
+    created = await db.create(TRANSFORMATION_TABLE, data)
+    if not created or not isinstance(created, list) or not created[0]:
+        raise HTTPException(status_code=500, detail="Failed to create transformation")
+    return TransformationModel(**(created[0].model_dump() if hasattr(created[0], 'model_dump') else dict(created[0])))
+
+@router.patch("/transformations/{transformation_id}", response_model=TransformationModel)
+async def update_transformation(transformation_id: str, transformation: TransformationModel, db: AsyncSurreal = Depends(get_db_connection)):
+    """Update an existing transformation."""
+    if ":" not in transformation_id:
+        raise HTTPException(status_code=400, detail="Invalid transformation ID format. Expected table:id")
+    update_data = transformation.model_dump(exclude_unset=True)
+    update_data["updated"] = datetime.utcnow()
+    updated = await db.merge(transformation_id, update_data)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Transformation not found")
+    return TransformationModel(**(updated.model_dump() if hasattr(updated, 'model_dump') else dict(updated)))
+
+@router.delete("/transformations/{transformation_id}", response_model=StatusResponse)
+async def delete_transformation(transformation_id: str, db: AsyncSurreal = Depends(get_db_connection)):
+    """Delete a transformation."""
+    if ":" not in transformation_id:
+        raise HTTPException(status_code=400, detail="Invalid transformation ID format. Expected table:id")
+    deleted = await db.delete(transformation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Transformation not found or already deleted")
+    return StatusResponse(status="success", message=f"Transformation {transformation_id} deleted successfully")
 

@@ -89,6 +89,7 @@ class SourceSummary(BaseModel):
     type: str  # e.g., "url", "pdf", "youtube"
     status: str  # e.g., "pending", "processing", "completed", "failed"
     created: datetime
+    updated: Optional[datetime] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 class Source(SourceSummary):
@@ -165,11 +166,16 @@ class AskResponse(BaseModel):
 
 class SourceResponse(BaseModel):
     id: str
-    title: Optional[str] = None
-    content: Optional[str] = None
+    title: str
+    type: str
+    status: str
     created: datetime
-    updated: datetime
-    metadata: Optional[Dict[str, Any]] = None
+    updated: Optional[datetime] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    full_text: Optional[str] = None
+    notebook_id: Optional[str] = None
+    insights: List[Dict[str, Any]] = Field(default_factory=list)
+    embedded_chunks: int = 0
 
 class NotebookResponse(BaseModel):
     id: str
@@ -255,4 +261,8 @@ class DefaultModels(BaseModel):
     )
 
 # Add other models as needed for Podcast, Search, Config etc.
+
+class NotesWithLogsResponse(BaseModel):
+    notes: List[NoteSummary]
+    logs: List[str]
 
